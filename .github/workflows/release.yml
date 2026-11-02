@@ -1,0 +1,27 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check Info.plist version matches tag
+        run: |
+          v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Info.plist has $v but tag is $GITHUB_REF_NAME"; exit 1; }
+      - run: Tests/run.sh
+      - run: UNIVERSAL=1 ./build.sh
+      - name: Package
+        run: |
+          ditto -c -k --keepParent build/SSOBar.app "SSOBar-$GITHUB_REF_NAME.zip"
+          shasum -a 256 "SSOBar-$GITHUB_REF_NAME.zip" > "SSOBar-$GITHUB_REF_NAME.zip.sha256"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "SSOBar $GITHUB_REF_NAME" --generate-notes \
+            "SSOBar-$GITHUB_REF_NAME.zip" "SSOBar-$GITHUB_REF_NAME.zip.sha256"

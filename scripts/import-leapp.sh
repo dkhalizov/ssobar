@@ -1,5 +1,7 @@
 #!/bin/sh
-# One-time import of Leapp AWS SSO sessions into ~/.config/ssobar/config.json (no secrets copied).
+# One-time import of Leapp AWS SSO sessions into ~/.config/ssobar/config.json.
+# Only names, account IDs, role names, regions and profile names are copied. No secrets.
+# Best effort: relies on the Leapp-lock.json format of Leapp 0.2x (encrypted with the machine ID).
 set -e
 OUT="$HOME/.config/ssobar/config.json"
 [ -f "$OUT" ] && [ "$1" != "--force" ] && { echo "$OUT exists (use --force to overwrite)"; exit 1; }

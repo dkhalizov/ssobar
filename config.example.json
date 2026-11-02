@@ -1,0 +1,10 @@
+{
+  "startUrl": "https://my-company.awsapps.com/start/",
+  "ssoRegion": "eu-west-1",
+  "refreshMinutesBefore": 10,
+  "sessions": [
+    { "name": "Production (read-only)", "accountId": "111111111111", "roleName": "ReadOnly",  "profile": "prod",    "active": true },
+    { "name": "Staging",                "accountId": "222222222222", "roleName": "PowerUser", "profile": "staging", "active": true },
+    { "name": "Sandbox",                "accountId": "333333333333", "roleName": "Admin",     "profile": "default", "active": false, "region": "us-east-1" }
+  ]
+}

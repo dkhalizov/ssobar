@@ -1,7 +1,11 @@
-// SSOBar — tiny menu bar app: AWS IAM Identity Center (SSO) roles -> ~/.aws/credentials, auto-refreshed.
-// No dependencies. SSO OIDC + portal APIs are plain HTTPS/JSON (no SigV4 needed).
+// SSOBar — a tiny macOS menu bar app that keeps AWS IAM Identity Center (SSO) role credentials
+// in ~/.aws/credentials and refreshes them automatically.
+//
+// No dependencies: the SSO OIDC and SSO portal APIs are plain HTTPS + JSON (no SigV4 signing needed).
+// SPDX-License-Identifier: MIT
 
 import AppKit
+import Network
 import ServiceManagement
 
 // MARK: - Paths
@@ -10,7 +14,11 @@ let home = FileManager.default.homeDirectoryForCurrentUser
 let configDir = home.appendingPathComponent(".config/ssobar")
 let configURL = configDir.appendingPathComponent("config.json")
 let stateURL = configDir.appendingPathComponent("state.json")
-let credsURL = home.appendingPathComponent(".aws/credentials")
+let defaultCredsPath = "~/.aws/credentials"
+
+func expandTilde(_ p: String) -> URL {
+    URL(fileURLWithPath: p.hasPrefix("~/") ? home.path + String(p.dropFirst(1)) : p)
+}
 
 // MARK: - Model
 
@@ -18,7 +26,7 @@ struct Session: Codable {
     var name: String
     var accountId: String
     var roleName: String
-    var region: String
+    var region: String?      // defaults to Config.ssoRegion
     var profile: String
     var active: Bool
     var key: String { "\(profile)|\(accountId)|\(roleName)" }
@@ -27,8 +35,11 @@ struct Session: Codable {
 struct Config: Codable {
     var startUrl: String
     var ssoRegion: String
-    var refreshMinutesBefore: Int?
+    var refreshMinutesBefore: Int?   // default 10
+    var credentialsFile: String?     // default ~/.aws/credentials
     var sessions: [Session]
+
+    var credsURL: URL { expandTilde(credentialsFile ?? defaultCredsPath) }
 }
 
 /// Secrets (0600). Never shown in UI.
@@ -51,7 +62,6 @@ struct APIError: LocalizedError {
     var errorDescription: String? { message.isEmpty ? "\(code) (HTTP \(status))" : "\(code): \(message)" }
 }
 struct NeedsLogin: LocalizedError { var errorDescription: String? { "Not signed in to AWS SSO" } }
-struct Msg: LocalizedError { let s: String; var errorDescription: String? { s } }
 
 // MARK: - Helpers
 
@@ -66,19 +76,6 @@ let decoder: JSONDecoder = {
     d.dateDecodingStrategy = .secondsSince1970
     return d
 }()
-
-/// Atomic write with 0600 permissions from the first byte.
-func writeSecure(_ data: Data, _ url: URL) throws {
-    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let tmp = url.path + ".ssobar-tmp"
-    unlink(tmp)
-    guard FileManager.default.createFile(atPath: tmp, contents: data, attributes: [.posixPermissions: 0o600]) else {
-        throw Msg(s: "cannot write \(tmp)")
-    }
-    guard rename(tmp, url.path) == 0 else {
-        throw Msg(s: "rename to \(url.path) failed: \(String(cString: strerror(errno)))")
-    }
-}
 
 func num(_ a: Any?) -> Double? { (a as? NSNumber)?.doubleValue }
 
@@ -169,49 +166,6 @@ func listAllRoles(portal: String, token: String) async throws -> [FoundRole] {
     }
 }
 
-// MARK: - ~/.aws/credentials
-
-enum CredFile {
-    /// Replace/insert `set` sections, drop `remove` sections, leave everything else untouched.
-    static func update(set: [String: [(String, String)]], remove: Set<String>) throws {
-        let old = (try? String(contentsOf: credsURL, encoding: .utf8)) ?? ""
-        var sections: [(name: String?, lines: [String])] = [(nil, [])]
-        for line in old.components(separatedBy: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("["), t.hasSuffix("]") {
-                sections.append((String(t.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces), []))
-            } else {
-                sections[sections.count - 1].lines.append(line)
-            }
-        }
-        func body(_ kv: [(String, String)]) -> [String] { kv.map { "\($0.0) = \($0.1)" } }
-        var out: [String] = []
-        var seen = Set<String>()
-        for s in sections {
-            guard let n = s.name else { out += s.lines; continue }
-            if let kv = set[n] {
-                if !seen.contains(n) { out += ["", "[\(n)]"] + body(kv) }
-                seen.insert(n)
-                continue
-            }
-            if remove.contains(n) { continue }
-            out += ["", "[\(n)]"] + s.lines
-        }
-        for n in set.keys.sorted() where !seen.contains(n) { out += ["", "[\(n)]"] + body(set[n]!) }
-
-        var norm: [String] = []
-        for l in out {
-            let blank = l.trimmingCharacters(in: .whitespaces).isEmpty
-            if blank && (norm.last.map { $0.isEmpty } ?? true) { continue }
-            norm.append(blank ? "" : l)
-        }
-        while norm.last == "" { norm.removeLast() }
-        let new = norm.isEmpty ? "" : norm.joined(separator: "\n") + "\n"
-        if new == old { return }
-        try writeSecure(Data(new.utf8), credsURL)
-    }
-}
-
 // MARK: - SSO (OIDC device flow + refresh token)
 
 @MainActor final class SSO {
@@ -220,7 +174,8 @@ enum CredFile {
     var region = "eu-west-1"
     var onStatus: ((String?) -> Void)?
     var loginURL: URL?
-    private var tokenTask: Task<String, Error>?
+    private var tokenTask: (seq: Int, task: Task<String, Error>)?
+    private var tokenSeq = 0
 
     init(state: State) { st = state }
 
@@ -228,7 +183,6 @@ enum CredFile {
     var portal: String { "https://portal.sso.\(region).amazonaws.com" }
     var hasValidAccess: Bool { (st.accessExpiresAt?.timeIntervalSinceNow ?? 0) > 120 && st.accessToken != nil }
     var signedIn: Bool { hasValidAccess || st.refreshToken != nil }
-    var loggingIn: Bool { loginURL != nil }
 
     func configure(startUrl: String, region: String) {
         self.startUrl = startUrl
@@ -252,12 +206,23 @@ enum CredFile {
         save()
     }
 
+    /// Single-flight: concurrent callers share one in-flight token request, so at most one device login (= one browser tab) exists.
     func accessToken(interactive: Bool) async throws -> String {
         if hasValidAccess, let t = st.accessToken { return t }
-        if let task = tokenTask { return try await task.value }
+        if let cur = tokenTask {
+            do { return try await cur.task.value }
+            catch is NeedsLogin where interactive {
+                // The shared attempt was silent-only but the user asked explicitly: start an interactive one
+                // (or join one that another explicit caller already started).
+                if hasValidAccess, let t = st.accessToken { return t }
+                if let newer = tokenTask, newer.seq != cur.seq { return try await newer.task.value }
+            }
+        }
+        tokenSeq += 1
+        let mine = tokenSeq
         let task = Task { try await self.obtain(interactive: interactive) }
-        tokenTask = task
-        defer { tokenTask = nil }
+        tokenTask = (mine, task)
+        defer { if tokenTask?.seq == mine { tokenTask = nil } }
         return try await task.value
     }
 
@@ -269,8 +234,13 @@ enum CredFile {
                     "clientId": id, "clientSecret": sec, "grantType": "refresh_token", "refreshToken": rt,
                 ])
                 return try storeToken(r)
-            } catch let e as APIError where (400..<500).contains(e.status) {
-                st.refreshToken = nil; st.accessToken = nil; save()   // session ended -> need browser
+            } catch let e as APIError where (400..<500).contains(e.status) && e.status != 429
+                                            && !e.code.lowercased().contains("throttl") && e.code != "slow_down" {
+                // session really ended -> need browser. (Network errors / throttling keep the refresh token.)
+                st.refreshToken = nil; st.accessToken = nil
+                if e.code.lowercased().contains("client") { st.clientId = nil; st.clientSecret = nil }
+                save()
+                try await ensureClient()
             }
         }
         guard interactive else { throw NeedsLogin() }
@@ -330,6 +300,8 @@ enum CredFile {
                 continue
             } catch let e as APIError where e.code == "slow_down" {
                 interval += 5
+            } catch is URLError {
+                continue   // network blip (e.g. just woke up): keep polling the same code, don't open a new tab
             }
         }
         throw Msg(s: "Sign-in timed out")
@@ -349,16 +321,26 @@ enum CredFile {
     var written: [String: String] = [:]  // profile -> session key currently in credentials file
     var errors: [String] = []
     var status: String?
-    var lastPrompt: Date?
+    /// Browser auto-open policy: at most ONE automatic tab per "you're back" event (launch, wake, unlock,
+    /// screen on, successful sign-in), and only while you're actually at the keyboard.
+    var autoPromptArmed = true
     var busy = false
     var again: (interactive: Bool, force: Bool)?
     var timer: Timer?
+    let net = NWPathMonitor()
+    var netUp = true
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // single instance: a second copy would be a second writer and a second login tab
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0 != .current }) {
+            NSApp.terminate(nil)
+            return
+        }
         sso.onStatus = { [weak self] s in
             guard let self else { return }
             self.status = s
-            if s != nil { self.lastPrompt = Date() }
+            if s != nil { self.autoPromptArmed = false }
             self.updateIcon()
         }
         loadConfig()
@@ -366,17 +348,48 @@ enum CredFile {
         menu.autoenablesItems = false
         item.menu = menu
         updateIcon()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
-        timer?.tolerance = 5
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 5_000_000_000)  // let the network come up
-                self?.tick()
+        t.tolerance = 5
+        RunLoop.main.add(t, forMode: .common)   // keep ticking while the menu is open
+        timer = t
+
+        // "user is back" events: re-arm one auto prompt and refresh right away
+        let ws = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.userIsBack() }
             }
         }
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.userIsBack() }
+        }
+        // network came back (after wake, Wi-Fi switch, VPN): refresh immediately instead of waiting a minute
+        net.pathUpdateHandler = { [weak self] path in
+            let up = path.status == .satisfied
+            Task { @MainActor in
+                guard let self else { return }
+                if up && !self.netUp { self.tick() }
+                self.netUp = up
+            }
+        }
+        net.start(queue: .main)
         tick()
+    }
+
+    func userIsBack() {
+        autoPromptArmed = true
+        tick()
+    }
+
+    /// True only if someone is at the Mac: recent input and screen not locked.
+    func userPresent() -> Bool {
+        let anyInput = CGEventType(rawValue: ~0)!
+        if CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput) > 120 { return false }
+        if let d = CGSessionCopyCurrentDictionary() as? [String: Any], d["CGSSessionScreenIsLocked"] as? Bool == true { return false }
+        return true
     }
 
     // MARK: Config
@@ -438,10 +451,10 @@ enum CredFile {
             force || written[p] != s.key || (expiry[p]?.timeIntervalSinceNow ?? -1) < margin
         }.map { ($0.key, $0.value) }
 
-        var set: [String: [(String, String)]] = [:]
+        var set: [String: CredFile.Section] = [:]
         var errs: [String] = []
         if !due.isEmpty {
-            let mayPrompt = interactive || (lastPrompt.map { $0.timeIntervalSinceNow < -1800 } ?? true)
+            let mayPrompt = interactive || (autoPromptArmed && userPresent())
             do {
                 var results: [String: Result<Creds, Error>] = [:]
                 for attempt in 0..<2 {
@@ -458,7 +471,7 @@ enum CredFile {
                     switch results[p] {
                     case .success(let c)?:
                         set[p] = [("aws_access_key_id", c.akid), ("aws_secret_access_key", c.secret),
-                                  ("aws_session_token", c.token), ("region", s.region)]
+                                  ("aws_session_token", c.token), ("region", s.region ?? cfg.ssoRegion)]
                         expiry[p] = c.expiration
                         written[p] = s.key
                     case .failure(let e)?:
@@ -477,7 +490,7 @@ enum CredFile {
         let remove = managed.subtracting(active.keys)
         if !set.isEmpty || !remove.isEmpty {
             do {
-                try CredFile.update(set: set, remove: remove)
+                try CredFile.update(at: cfg.credsURL, set: set, remove: remove)
                 managed.formUnion(set.keys)
                 managed.subtract(remove)
                 for p in remove { expiry[p] = nil; written[p] = nil }
@@ -572,6 +585,8 @@ enum CredFile {
         let login = action("Launch at login", #selector(toggleLaunchAtLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(.separator())
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        note("SSOBar \(v)")
         _ = action("Quit SSOBar", #selector(quit), "q")
     }
 
@@ -607,7 +622,11 @@ enum CredFile {
         }
     }
 
-    @objc func signOut() { sso.signOut(); updateIcon() }
+    @objc func signOut() {
+        autoPromptArmed = false   // don't pop a browser tab right after an explicit sign-out
+        sso.signOut()
+        updateIcon()
+    }
     @objc func reopenLogin() { if let u = sso.loginURL { NSWorkspace.shared.open(u) } }
     @objc func refreshNow() { tick(interactive: true, force: true) }
 
@@ -627,7 +646,7 @@ enum CredFile {
                 var added = 0
                 for f in found where !c.sessions.contains(where: { $0.accountId == f.account && $0.roleName == f.role }) {
                     c.sessions.append(Session(name: "\(f.accountName) · \(f.role)", accountId: f.account, roleName: f.role,
-                                              region: c.ssoRegion, profile: "default", active: false))
+                                              region: nil, profile: "default", active: false))
                     added += 1
                 }
                 if added > 0 { cfg = c; saveConfig() }

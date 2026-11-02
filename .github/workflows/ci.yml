@@ -1,0 +1,17 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - run: swiftc --version
+      - name: Unit tests
+        run: Tests/run.sh
+      - name: Build universal app
+        run: UNIVERSAL=1 ./build.sh
